@@ -1,0 +1,25 @@
+[Unit]
+Description=Periodic heal — restarts the Hermes recovery unit so it re-runs
+
+# WHY THIS EXISTS INSTEAD OF THE TIMER CALLING hermes-stack-restore DIRECTLY:
+# that unit needs RemainAfterExit=yes, or systemd tears down its cgroup when
+# ExecStart returns and kills the ssh forwards it just created. But
+# RemainAfterExit also makes `start` a no-op once the unit is active -- and a
+# timer issues `start`. Pointed straight at it, the timer would fire on schedule
+# and do NOTHING, reporting success every time. Verified 2026-08-24: NEXT stayed
+# empty and the unit never re-ran.
+#
+# So the timer starts this instead, and this issues an explicit `restart`.
+
+#
+# ExecCondition: never restart a restore that is still RUNNING. At boot the
+# restore waits minutes for the model and the sandbox; on 2026-10-23 this timer
+# (OnBootSec=2min) restarted it mid-wait, SIGTERMing the boot restore and
+# orphaning its sleep. The restore is Type=exec with RemainAfterExit, so while
+# its script runs it is active/running; once finished it is active/exited, and
+# a restart is what we want. A non-zero ExecCondition skips this run cleanly;
+# it is not a failure.
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'test "$$(systemctl --user show -p SubState --value hermes-stack-restore.service)" != running'
+ExecStart=/usr/bin/systemctl --user restart hermes-stack-restore.service

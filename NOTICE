@@ -1,0 +1,36 @@
+Hermes Agent on DGX Spark — quickstart
+Copyright 2026 Exxact Corporation
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This repository contains installer and teardown tooling only. It orchestrates,
+but does not redistribute, the following independently licensed software:
+
+  NemoClaw / nemohermes   NVIDIA Corporation          Apache-2.0
+                          https://github.com/NVIDIA/NemoClaw
+  Hermes Agent            Nous Research               MIT
+                          https://github.com/NousResearch/hermes-agent
+  vLLM                    vLLM project                Apache-2.0
+  OpenShell               NVIDIA Corporation          Apache-2.0
+                          https://github.com/NVIDIA/OpenShell
+
+Container images referenced by profiles are pinned by digest and are the work of
+their respective publishers:
+
+  nvcr.io/nvidia/vllm            NVIDIA, via NGC
+  ghcr.io/bjk110/vllm-spark      JK (github.com/bjk110), built from
+                                 github.com/bjk110/spark_vllm_docker (Apache-2.0)
+
+Base and helper images pulled during an install (each under its publisher's own
+license):
+
+  node:22-trixie                 Docker Official Image (Node.js project, MIT)
+  nginx:alpine                   Docker Official Image (nginx; BSD-2-Clause)
+  alpine:3                       Docker Official Image (Alpine Linux)
+
+Model weights are downloaded by the user from their original sources and are
+governed by their own licenses.

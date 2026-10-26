@@ -1,0 +1,19 @@
+[Unit]
+Description=Keep the Hermes stack healthy (periodic heal)
+Documentation=file://%h/git/exx-hermes-spark-quickstart/host/README.md
+
+[Timer]
+# Recovery already existed but was wired to exactly one trigger: boot. If the
+# agent dies at 2pm it stayed dead until someone noticed. hermes-stack-restore
+# is idempotent and returns in milliseconds when the dashboard answers, so
+# running it on a schedule costs nothing and makes the stack self-healing
+# rather than only boot-healing.
+OnBootSec=2min
+# OnUnitInactiveSec, not OnUnitActiveSec: the heal unit is a oneshot that goes
+# inactive the moment it finishes, so "15 min after it was last ACTIVE" never
+# schedules -- NEXT stays empty and the timer silently never fires.
+OnUnitInactiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

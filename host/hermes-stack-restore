@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Bring the containerized-Hermes stack back after a reboot.
+#
+# What does NOT survive a reboot on its own:
+#   - hermes-spark-vllm       (docker RestartPolicy=no)
+#   - the two ssh forwards    (openshell ssh-proxy, orphaned to the user manager)
+#   - the Hermes agent INSIDE the sandbox -- see below
+#   - the desktop token       (rotates whenever the dashboard restarts)
+#   - the dashboard proxy, on installs made before it got a restart policy
+#   - the sandbox itself, on NemoClaw 0.0.137 -- restart policy 'no', and the
+#     nemoclaw-openshell-gateway user service starts the gateway, not sandboxes
+#
+# ⚠ THE LESSON FROM 2026-10-23, the first real host reboot on 0.0.137: a
+# sandbox whose container is killed by the shutdown lands in OpenShell
+# Phase: Error, which is terminal (start needs Stopped, stop needs Ready,
+# recover skips it). hermes-sandbox-shutdown.service stops it cleanly before
+# Docker goes down, leaving it Stopped; this script then runs the vendor
+# `<agent> <sandbox> start`. Error is reported, never papered over.
+#
+# ⚠ THE LESSON FROM 2026-08-21, learned by rehearsing a reboot for real:
+# a listening port is NOT a working forward. After the sandbox restarts, the
+# container is up, `ss` shows 127.0.0.1:18795 bound, and every naive check
+# passes -- while the forward points at a dead ssh session and Hermes inside the
+# sandbox is not running at all. The previous version of this script saw
+# "forward already up" and declared success. It was wrong, and the desktop app
+# stayed broken.
+#
+# So: probe the REAL endpoint, never the port. Same rule as the model, where
+# "container Up" was already known not to mean "serving".
+set -euo pipefail
+
+# host/ scripts are installed to ~/.local/bin and run detached from this repo,
+# so they cannot source a repo-relative path. Try both locations; fall back to
+# self-contained definitions if neither is present, because these scripts must
+# keep working even if the repo is deleted after installation.
+_hermes_common_loaded=0
+for _c in "$(dirname "$(readlink -f "$0")")/../scripts/lib/common.sh" \
+          "$HOME/.local/lib/hermes-quickstart/common.sh"; do
+  if [ -r "$_c" ]; then . "$_c"; _hermes_common_loaded=1; break; fi
+done
+if [ "$_hermes_common_loaded" = 0 ]; then
+  hermes_dashboard_token() {
+    curl -s --max-time "${2:-8}" -H 'Host: localhost' "${1:?}/" 2>/dev/null \
+      | grep -oP '__HERMES_SESSION_TOKEN__\s*=\s*"\K[^"]+' | head -1
+  }
+  hermes_dashboard_ok() { [ -n "$(hermes_dashboard_token "${1:?}" "${2:-6}")" ]; }
+  hermes_parse_phase() { sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "Phase:" && !p { print $2; p = 1 }'; }
+  hermes_sandbox_phase() { { openshell sandbox get "${1:?}" 2>/dev/null | hermes_parse_phase; } || true; }
+  hermes_forward_restart() {
+    timeout 60 openshell forward stop "${1:?}" "${2:?}" >/dev/null 2>&1 || true
+    timeout 120 openshell forward start --background "${1:?}" "${2:?}" >/dev/null 2>&1 || true
+  }
+  hermes_gateway_pin() { openshell sandbox list >/dev/null 2>&1 && echo "(active)"; }
+  hermes_gateway_active() { head -1 "$HOME/.config/openshell/active_gateway" 2>/dev/null; }
+fi
+# Added after the first installs: a common.sh installed by an older run lacks
+# these, so define them here rather than require a re-install of the library.
+if ! declare -F hermes_vllm_inspect_crashed >/dev/null; then
+  hermes_vllm_inspect_crashed() {
+    local logs
+    logs="$(docker logs ${2:+--since "$2"} "${1:?}" 2>&1)" || true
+    grep -qE "vllm\.model_executor\.models\.registry.*died with <Signals\.SIGSEGV" <<<"$logs"
+  }
+fi
+: "${HERMES_VLLM_START_ATTEMPTS:=3}"
+export PATH="$HOME/.local/bin:$PATH"
+
+SANDBOX="${HERMES_SANDBOX_NAME:-hermes-demo}"
+VLLM="${HERMES_VLLM_CONTAINER:-hermes-spark-vllm}"
+VLLM_PORT="${HERMES_VLLM_PORT:-8000}"
+UI="${HERMES_CONTROL_UI_URL:-http://127.0.0.1:18795}"
+AGENT_CLI="${HERMES_AGENT_CLI:-nemohermes}"
+MARK="${XDG_STATE_HOME:-$HOME/.local/state}/hermes-quickstart/stopped-for-shutdown"
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# One restore at a time. The heal timer's ExecCondition already refuses to
+# restart this unit mid-run (on 2026-10-23 it SIGTERMed a boot restore that
+# was still waiting for the sandbox); this covers a second copy run by hand.
+LOCK="$(dirname "$MARK")/restore.pid"
+mkdir -p "$(dirname "$LOCK")"
+if _other="$(cat "$LOCK" 2>/dev/null)" && [ -n "$_other" ] && [ "$_other" != $$ ] \
+   && kill -0 "$_other" 2>/dev/null; then
+  log "another hermes-stack-restore is running (pid $_other) -- leaving it to finish"
+  exit 0
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+dashboard_ok() { curl -s --max-time 6 -H 'Host: localhost' "$UI/" 2>/dev/null | grep -q '__HERMES_SESSION_TOKEN__'; }
+
+model_ok() { curl -sSf --max-time 5 "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null 2>&1; }
+
+# 1. Model. Started here, waited for in step 3, so the sandbox start below
+# overlaps the model load instead of queueing behind it.
+# ⚠ vLLM intermittently dies at startup of a known NVIDIA-image bug (a SIGSEGV
+# while inspecting the model class -- see hermes_vllm_inspect_crashed in
+# scripts/lib/common.sh). The container then stays Exited and, with restart
+# policy 'no', nothing brings it back, so step 3 below restarts it, bounded.
+VLLM_START=1 VLLM_STARTED_AT="$(date +%s)"
+if ! model_ok; then
+  log "starting $VLLM"
+  docker start "$VLLM" >/dev/null 2>&1 || log "warn: could not start $VLLM"
+fi
+
+# 1b. The network-facing dashboard proxy (nginx), if this install has one.
+# Older installs started it with no restart policy, so it stayed down after a
+# reboot while everything else recovered. Give it the policy it should have had
+# and start it. Independent of the agent, so it runs before step 2 can exit.
+# A proxy that was deliberately removed (--stop) does not exist, so it is left
+# alone.
+DASH="${HERMES_DASH_CONTAINER:-hermes-dash-$SANDBOX}"
+if docker container inspect "$DASH" >/dev/null 2>&1; then
+  docker update --restart unless-stopped "$DASH" >/dev/null 2>&1 || true
+  if [ "$(docker container inspect -f '{{.State.Running}}' "$DASH" 2>/dev/null)" != true ]; then
+    docker start "$DASH" >/dev/null 2>&1 && log "started $DASH" || log "warn: could not start $DASH"
+  fi
+fi
+
+# 2. The sandbox, as OpenShell sees it. A running container is not a Ready
+# sandbox. This unit is deliberately NOT ordered after the gateway unit (that
+# was an ordering cycle), so wait for the gateway to answer first.
+phase="" gw=""
+for _ in $(seq 1 60); do
+  if gw="$(hermes_gateway_pin "$SANDBOX")" && openshell sandbox list >/dev/null 2>&1; then
+    phase="$(hermes_sandbox_phase "$SANDBOX")"; break
+  fi
+  gw=""; sleep 5
+done
+if [ -z "$gw" ]; then
+  log "ERROR: no OpenShell gateway answered in 5 min (active: '$(hermes_gateway_active)')."
+  log "  Every openshell call will be refused. Check: openshell gateway list;"
+  log "  systemctl --user status nemoclaw-openshell-gateway"
+  exit 1
+fi
+log "gateway: $gw"
+log "sandbox $SANDBOX phase: ${phase:-unknown}"
+if [ -z "$phase" ]; then
+  log "ERROR: gateway '$gw' does not know sandbox $SANDBOX. Rebuild it:"
+  log "  cd <repo> && ./scripts/reset.py down --sandbox $SANDBOX --yes"
+  log "  ./install.sh --profile profiles/<profile>.conf"
+  exit 1
+fi
+case "$phase" in
+  Stopped)
+    # Only a stop made by hermes-sandbox-stop at shutdown is undone here. A
+    # sandbox someone stopped by hand stays stopped -- the heal timer runs this
+    # every 15 minutes and must not fight them.
+    if [ -f "$MARK" ]; then
+      log "stopped for shutdown -- running '$AGENT_CLI $SANDBOX start'"
+      timeout 900 "$AGENT_CLI" "$SANDBOX" start </dev/null >/dev/null 2>&1 \
+        || log "warn: '$AGENT_CLI $SANDBOX start' reported problems"
+      for _ in $(seq 1 60); do
+        phase="$(hermes_sandbox_phase "$SANDBOX")"
+        [ "$phase" = Ready ] && break
+        sleep 5
+      done
+      log "sandbox $SANDBOX phase: ${phase:-unknown}"
+      if [ "$phase" = Ready ]; then rm -f "$MARK"; fi
+    else
+      log "sandbox was stopped by hand -- leaving it. Start it: $AGENT_CLI $SANDBOX start"
+      exit 0
+    fi ;;
+  Error)
+    log "ERROR: OpenShell reports $SANDBOX in Phase: Error. Nothing clears that"
+    log "  (start needs Stopped, stop needs Ready). Usually the host went down"
+    log "  without hermes-sandbox-shutdown.service stopping it first. Recover:"
+    log "  cd <repo> && ./scripts/reset.py down --sandbox $SANDBOX --yes"
+    log "  ./install.sh --profile profiles/<profile>.conf"
+    exit 1 ;;
+esac
+
+# 3. Model serving? Poll the real endpoint -- "Up" is not "serving".
+for _ in $(seq 1 120); do
+  model_ok && break
+  if [ "$(docker container inspect -f '{{.State.Running}}' "$VLLM" 2>/dev/null)" = false ] \
+     && hermes_vllm_inspect_crashed "$VLLM" "$VLLM_STARTED_AT"; then
+    if [ "$VLLM_START" -lt "$HERMES_VLLM_START_ATTEMPTS" ]; then
+      log "vLLM start $VLLM_START/$HERMES_VLLM_START_ATTEMPTS hit the known NVIDIA-image exit-time SIGSEGV (model inspection); starting it again"
+      VLLM_START=$((VLLM_START + 1)) VLLM_STARTED_AT="$(date +%s)"
+      docker start "$VLLM" >/dev/null 2>&1 || log "warn: could not start $VLLM"
+    else
+      log "warn: vLLM hit the exit-time SIGSEGV $VLLM_START times; not retrying again (next heal run will)"
+      break
+    fi
+  fi
+  sleep 10
+done
+model_ok && log "model serving" || log "warn: model still not serving"
+
+# 4. Forwards + agent, judged ONLY by whether the dashboard actually answers.
+if dashboard_ok; then
+  log "dashboard already answering"
+else
+  log "dashboard not answering -- rebuilding forwards"
+  for port in 18795 8642; do
+    timeout 60 openshell forward stop "$port" "$SANDBOX" >/dev/null 2>&1 || true
+    timeout 120 openshell forward start --background "$port" "$SANDBOX" >/dev/null 2>&1 \
+      || log "warn: forward $port did not start"
+  done
+  sleep 5
+
+  # Still dead? Then the agent inside the sandbox is not running. The container
+  # coming back does NOT restart Hermes; `recover` is the sanctioned repair.
+  if ! dashboard_ok; then
+    log "still dead -- running 'nemohermes $SANDBOX recover'"
+    timeout 600 nemohermes "$SANDBOX" recover >/dev/null 2>&1 || log "warn: recover reported problems"
+    for port in 18795 8642; do
+      timeout 60 openshell forward stop "$port" "$SANDBOX" >/dev/null 2>&1 || true
+      timeout 120 openshell forward start --background "$port" "$SANDBOX" >/dev/null 2>&1 || true
+    done
+    for _ in $(seq 1 24); do dashboard_ok && break; sleep 5; done
+  fi
+fi
+
+if dashboard_ok; then
+  log "dashboard answering"
+else
+  log "ERROR: dashboard still not answering. Manual recovery:"
+  log "  cd <repo> && ./scripts/reset.py down --sandbox $SANDBOX --yes"
+  log "  ./install.sh --profile profiles/<profile>.conf"
+  exit 1
+fi
+
+# 5. Desktop token.
+hermes-desktop-token-sync || log "warn: token sync failed"
+log "done"

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Keep the Hermes desktop app's connection.json in step with the container's
+# dashboard session token.
+#
+# Why this exists: the token is minted in-memory at
+# /opt/hermes/hermes_cli/web_server.py:281 as
+#   os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+# so it ROTATES on every dashboard restart, and the desktop app then shows
+# "your remote gateway session has expired". Nothing is actually wrong; the
+# app is just holding a stale token.
+#
+# Run at boot (see hermes-desktop-token-sync.service) or by hand any time the
+# app complains.
+set -euo pipefail
+
+# host/ scripts are installed to ~/.local/bin and run detached from this repo,
+# so they cannot source a repo-relative path. Try both locations; fall back to
+# self-contained definitions if neither is present, because these scripts must
+# keep working even if the repo is deleted after installation.
+_hermes_common_loaded=0
+for _c in "$(dirname "$(readlink -f "$0")")/../scripts/lib/common.sh" \
+          "$HOME/.local/lib/hermes-quickstart/common.sh"; do
+  if [ -r "$_c" ]; then . "$_c"; _hermes_common_loaded=1; break; fi
+done
+if [ "$_hermes_common_loaded" = 0 ]; then
+  hermes_dashboard_token() {
+    curl -s --max-time "${2:-8}" -H 'Host: localhost' "${1:?}/" 2>/dev/null \
+      | grep -oP '__HERMES_SESSION_TOKEN__\s*=\s*"\K[^"]+' | head -1
+  }
+  hermes_dashboard_ok() { [ -n "$(hermes_dashboard_token "${1:?}" "${2:-6}")" ]; }
+  hermes_forward_restart() {
+    timeout 60 openshell forward stop "${1:?}" "${2:?}" >/dev/null 2>&1 || true
+    timeout 120 openshell forward start --background "${1:?}" "${2:?}" >/dev/null 2>&1 || true
+  }
+fi
+
+CONN="${HERMES_DESKTOP_CONN:-$HOME/.config/Hermes/connection.json}"
+URL="${HERMES_CONTROL_UI_URL:-http://127.0.0.1:18795}"
+TRIES="${HERMES_TOKEN_SYNC_TRIES:-60}"
+
+[[ -f "$CONN" ]] || { echo "no desktop config at $CONN -- nothing to sync" >&2; exit 0; }
+
+# Wait for the dashboard to actually answer. Poll the real endpoint, not a
+# container status: "Up" and "serving" are different things.
+token=""
+for _ in $(seq 1 "$TRIES"); do
+  token="$(curl -s --max-time 5 -H 'Host: localhost' "$URL/" \
+    | grep -oP '__HERMES_SESSION_TOKEN__\s*=\s*"\K[^"]+' | head -1 || true)"
+  [[ -n "$token" ]] && break
+  sleep 5
+done
+[[ -n "$token" ]] || { echo "dashboard did not serve a token at $URL" >&2; exit 1; }
+
+# Only rewrite when it actually changed -- keeps the file's mtime meaningful.
+python3 - "$CONN" "$token" <<'PY'
+import json, sys, os, tempfile
+path, token = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    cfg = json.load(fh)
+current = cfg.get("remote", {}).get("token", {}).get("value")
+if current == token:
+    print("token unchanged -- no rewrite")
+    raise SystemExit(0)
+cfg.setdefault("remote", {}).setdefault("token", {})["value"] = token
+cfg["remote"]["token"].setdefault("encoding", "plain")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+os.replace(tmp, path)
+print(f"token updated: {(current or 'none')[:12]}... -> {token[:12]}...")
+PY
+
+# Prove it, rather than assuming: the token must actually authenticate.
+code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$URL/api/sessions")"
+[[ "$code" == 200 ]] || { echo "token written but /api/sessions returned $code" >&2; exit 1; }
+echo "verified: /api/sessions -> 200"

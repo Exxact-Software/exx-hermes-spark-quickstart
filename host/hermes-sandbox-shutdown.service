@@ -1,0 +1,33 @@
+# SYSTEM unit. scripts/install-host-services.sh fills in the @...@ placeholders
+# and installs it to /etc/systemd/system/.
+#
+# Why a system unit and not another user unit: the thing to beat is Docker
+# killing the sandbox container at shutdown. docker.service is a system unit,
+# and user units cannot be ordered against it. A system unit can:
+#
+#   After=docker.service        -> stopped BEFORE docker stops its containers
+#   After=user@@UID@.service    -> stopped BEFORE the user manager, so the
+#                                  OpenShell gateway (a user service) is still up
+#
+# Stop order is the reverse of start order. ExecStart does nothing; the work is
+# ExecStop, which systemd runs at shutdown because RemainAfterExit keeps the
+# unit active for the whole uptime.
+[Unit]
+Description=Stop the Hermes sandbox cleanly before Docker shuts down
+After=docker.service user@@UID@.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+Environment=HOME=@HOME@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=HERMES_SANDBOX_NAME=@SANDBOX@
+Environment=HERMES_AGENT_CLI=@AGENT_CLI@
+ExecStart=/usr/bin/true
+ExecStop=@HOME@/.local/bin/hermes-sandbox-stop
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

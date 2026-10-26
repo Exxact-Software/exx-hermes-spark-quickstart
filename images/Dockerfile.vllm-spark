@@ -1,0 +1,42 @@
+# Exxact's vLLM image for DGX Spark (GB10 / SM121 / aarch64).
+#
+# WHY THIS EXISTS
+# ---------------
+# The quickstart previously depended on two images it should not ship:
+#   * ghcr.io/bjk110/vllm-spark -- a third-party community build. Good work by a
+#     real person with a public Apache-2.0 build repo, but not something to ask
+#     Exxact customers to pull.
+#   * vllm-spark-qwen35-lmhead-fix:local -- a `docker commit` of a live
+#     container. No Dockerfile, in no registry, rebuildable by nobody. Anyone
+#     cloning this repo simply cannot run the Qwen profile.
+#
+# The base below is NVIDIA's own NGC vLLM: public guest-pull, multi-arch, and
+# published with a cosign signature, SBOM and VEX. Pinned by digest, never by
+# tag, so a silent upstream re-push cannot change what customers run.
+#
+# WHAT THE ONE PATCH FIXES
+# ------------------------
+# NGC 26.07-py3 ships vLLM 0.24.0+092c4842.dev, whose tool-parser code does:
+#
+#     from xgrammar import StructuralTag, normalize_tool_choice
+#         -- vllm/tool_parsers/structural_tag_registry.py:12
+#
+# but its metadata pins `xgrammar==0.2.0`, and 0.2.0 does not export
+# normalize_tool_choice. The image is internally inconsistent: it starts,
+# serves, and answers chat perfectly, while EVERY tool call fails with
+# "cannot import name 'normalize_tool_choice' from 'xgrammar'".
+#
+# That is the dangerous shape of bug -- an agent whose tools never fire looks
+# like a stupid model, not a broken install. Verified on a Spark 2026-08-21;
+# 0.2.1 is the earliest release exporting the symbol.
+#
+# Note what is NOT patched here: the qwen3_5 lm_head quant_config fix that the
+# local image was built for is already present upstream (vLLM PR #42124, first
+# released in 0.23.0) and in this base. Do not re-add it.
+FROM nvcr.io/nvidia/vllm@sha256:95c498a475142c20c989c65e5d223348c09fed83ba17ddf44f117610c0bd3268
+
+RUN pip install --no-cache-dir "xgrammar==0.2.1"
+
+# Fail the BUILD rather than a customer's install if the symbol is still absent.
+RUN python3 -c "import xgrammar; assert hasattr(xgrammar, 'normalize_tool_choice'), 'xgrammar is missing normalize_tool_choice'" \
+ && python3 -c "import vllm; print('vllm', vllm.__version__)"

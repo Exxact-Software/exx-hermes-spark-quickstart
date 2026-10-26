@@ -1,0 +1,39 @@
+[Unit]
+Description=Restore the containerized Hermes stack (model, forwards, desktop token)
+# NOT After=nemoclaw-openshell-gateway.service. That unit is After=default.target,
+# and this one is WantedBy=default.target, so ordering after it is a cycle:
+# systemd broke it at boot on 2026-10-23 by DELETING this job, and the unit
+# never ran while `is-enabled` still said enabled. Wants= pulls the gateway in
+# without ordering; the script waits for the gateway and endpoints itself.
+After=network-online.target
+Wants=network-online.target nemoclaw-openshell-gateway.service
+
+[Service]
+# Type=exec, NOT oneshot. A target waits for every unit it Wants= (targets get
+# an implicit After= on them), and a oneshot stays "activating" until its script
+# exits. So default.target waited for this restore -- and the gateway unit is
+# After=default.target, so the gateway could not start until this restore gave
+# up waiting for it. Observed on the 2026-10-23 16:20 reboot: "no OpenShell
+# gateway answered in 120 s", and the stack stayed down until the heal timer
+# ran 15 minutes later. With exec, the unit is active once the script has
+# started, default.target is reached, and the gateway comes up beside it.
+Type=exec
+
+# BOTH of these are load-bearing, and each was learned by breaking it.
+#
+# RemainAfterExit=yes -- without it systemd tears down this unit's cgroup the
+# moment ExecStart returns, which KILLS the `openshell forward start --background`
+# ssh processes we just created. Observed 2026-08-21: the unit reported success,
+# the dashboard verified 200, and both forwards were gone ~30s later. Running the
+# same script by hand worked fine, because a login shell's processes are not in
+# the unit's cgroup. The cost of this flag: `systemctl start` becomes a no-op
+# once the unit is active, so re-run it with `systemctl --user restart`.
+RemainAfterExit=yes
+
+# KillMode=process -- belt and braces for the same problem: only the main
+# process is signalled on stop, never the forwards it spawned.
+KillMode=process
+ExecStart=%h/.local/bin/hermes-stack-restore
+
+[Install]
+WantedBy=default.target

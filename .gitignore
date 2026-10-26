@@ -1,0 +1,6 @@
+.env
+*.log
+*.htpasswd
+dashboard.password
+__pycache__/
+*.pyc

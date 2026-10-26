@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Stop the Hermes sandbox gracefully while the host shuts down.
+#
+# Run as ExecStop of hermes-sandbox-shutdown.service, a SYSTEM unit ordered
+# After=docker.service and After=user@<uid>.service. Stop order is the reverse
+# of start order, so this runs while Docker and the OpenShell gateway (a user
+# service) are both still up.
+#
+# ⚠ WHY: on NemoClaw 0.0.137 the sandbox container has restart policy 'no' and
+# nothing stops it at shutdown. Docker kills it (exit 143), OpenShell records
+# "Container exited" and moves the sandbox to Phase: Error -- and Error is
+# terminal. `start` needs Stopped, `stop` needs Ready, `recover` skips it, and
+# `docker start` brings the container up while the phase stays Error. Observed
+# on a real reboot 2026-10-23; the only way back was destroying the sandbox.
+# NemoClaw's documented path for a stopped sandbox is `<agent> <name> start`,
+# which needs Phase: Stopped -- so we put it there before the host goes down.
+#
+# Acts only while the system is shutting down, so `systemctl stop` or
+# `disable --now` by hand (reset.py does that) never stops a live demo.
+# --force skips that check, for testing.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+_c="$HOME/.local/lib/hermes-quickstart/common.sh"
+if [ -r "$_c" ]; then . "$_c"; else
+  hermes_parse_phase() { sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "Phase:" && !p { print $2; p = 1 }'; }
+  hermes_sandbox_phase() { { openshell sandbox get "${1:?}" 2>/dev/null | hermes_parse_phase; } || true; }
+  hermes_gateway_pin() { return 1; }
+  hermes_gateway_active() { head -1 "$HOME/.config/openshell/active_gateway" 2>/dev/null; }
+fi
+
+SANDBOX="${HERMES_SANDBOX_NAME:-hermes-demo}"
+AGENT_CLI="${HERMES_AGENT_CLI:-nemohermes}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hermes-quickstart"
+MARK="$STATE/stopped-for-shutdown"
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+if [ "${1:-}" != --force ]; then
+  case "$(systemctl is-system-running 2>/dev/null)" in
+    stopping) ;;
+    *) log "not shutting down -- leaving $SANDBOX alone (use --force to stop anyway)"; exit 0 ;;
+  esac
+fi
+
+# Talk to a gateway that is actually listening -- the sandbox's own first, then
+# the active one, then the default. An unreachable gateway prints no phase, and
+# "no phase" used to be read as "not Ready -- nothing to stop" (2026-10-23).
+if gw="$(hermes_gateway_pin "$SANDBOX")"; then
+  log "gateway: $gw"
+else
+  log "ERROR: no OpenShell gateway is listening (active: '$(hermes_gateway_active)')."
+  log "  The sandbox cannot be stopped cleanly; docker will kill it and it will"
+  log "  come back in Phase: Error. Check: openshell gateway list"
+fi
+
+phase="$(hermes_sandbox_phase "$SANDBOX")"
+log "$SANDBOX phase before shutdown: ${phase:-unknown}"
+case "$phase" in
+  Ready) ;;
+  Stopped) log "already Stopped -- nothing to do"; exit 0 ;;
+  "")
+    # Unknown is NOT "not running". Try the stop anyway: if the sandbox exists
+    # it may still reach Stopped; if not, fail loudly so the journal says so.
+    log "ERROR: OpenShell reported no phase for $SANDBOX -- attempting the stop anyway" ;;
+  *) log "phase $phase is not stoppable -- nothing to do"; exit 0 ;;
+esac
+
+mkdir -p "$STATE"
+# Budget: TimeoutStopSec=180. A sandbox in an unknown state gets a shorter try
+# so the hook still finishes (and logs) before systemd gives up on it.
+t_cli=90 t_os=60 polls=30
+[ -n "$phase" ] || { t_cli=40; t_os=30; polls=10; }
+# The vendor command first; fall back to OpenShell directly if the agent CLI is
+# missing or hangs.
+timeout "$t_cli" "$AGENT_CLI" "$SANDBOX" stop </dev/null >/dev/null 2>&1 \
+  || timeout "$t_os" openshell sandbox stop "$SANDBOX" </dev/null >/dev/null 2>&1 || true
+for _ in $(seq 1 "$polls"); do
+  phase="$(hermes_sandbox_phase "$SANDBOX")"
+  [ "$phase" = Stopped ] && break
+  sleep "${HERMES_STOP_POLL_INTERVAL:-2}"
+done
+if [ "$phase" = Stopped ]; then
+  date '+%s' > "$MARK"
+  log "$SANDBOX is Stopped -- hermes-stack-restore will start it at boot"
+else
+  log "ERROR: $SANDBOX did not reach Stopped (phase ${phase:-unknown}) -- expect Phase: Error after boot"
+  exit 1
+fi
