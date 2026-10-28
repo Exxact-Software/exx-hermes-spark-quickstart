@@ -13,6 +13,19 @@ cd exx-hermes-spark-quickstart
 Roughly ten minutes on a warm box; longer the first time, because the agent
 image is built locally.
 
+**You will be asked to accept NVIDIA's NemoClaw licence and third-party
+notice.** The installer retrieves NemoClaw from NVIDIA, and accepting its terms
+is yours to do, not ours. At a terminal it shows the notice and asks
+`Accept? [y/N]`; answer `y` and the install continues. With no terminal (CI,
+`ssh -T`, a pipe) there is nothing to ask, so pass the flag instead:
+
+```bash
+./install.sh --profile profiles/spark-qwen38.conf --accept-nemoclaw-license
+```
+
+Without a terminal and without the flag the install stops at phase 0 and
+changes nothing.
+
 ---
 
 ## Configuration lives in profiles
@@ -157,6 +170,19 @@ generated password is written to `~/.hermes-quickstart/dashboard.password`
 - **Hermes Agent on the host is NOT a prerequisite any more** — `install.sh`
   installs it (phase 1/5) and builds the desktop client. Pass
   `--skip-host-install` if you already have it.
+
+**The desktop client is pinned to the sandbox's Hermes version.** The agent runs
+inside the sandbox at the version NemoClaw ships (Hermes 0.21.3, tag
+`v2026.9.14` for the pinned NemoClaw tag); the desktop client is built on the
+host. A client built from upstream HEAD is *ahead* of that gateway, which
+validates strictly, so every prompt fails with `title, preview: Extra inputs
+are not permitted`. `install-hermes-host.sh` therefore checks the host checkout
+out at the matching tag (derived from the running sandbox when there is one,
+else the pin `HERMES_HOST_REF_PIN` in `scripts/lib/common.sh`; `--ref` overrides)
+and rebuilds the client when its build stamp is from another commit. The
+healthcheck compares the two. After every build it sets `chrome-sandbox` to
+`root:root 4755`, which Electron needs where unprivileged user namespaces are
+restricted (this uses `sudo`).
 
 ### Why the host Hermes install is a prerequisite
 
@@ -372,6 +398,7 @@ Copy a profile and change these. **No code changes.**
 | `MAX_MODEL_LEN` | **≥ 64000**, enforced |
 | `VLLM_IMAGE` | some checkpoints need a specific build |
 | `VLLM_EXTRA_ARGS` | escape hatch for per-model flags, e.g. `--reasoning-parser qwen3` |
+| `AGENT_THINKING` | optional, `default` or `off`. `off` starts vLLM with `--default-chat-template-kwargs '{"enable_thinking": false}'`, so a reasoning model answers without its thinking phase unless a request asks for it. Only `profiles/spark-video.conf` sets it |
 
 `VLLM_EXTRA_ARGS` exists because the profile is *not* always sufficient on its
 own: `profiles/spark-qwen38.conf` needs a reasoning parser that Gemma does not.

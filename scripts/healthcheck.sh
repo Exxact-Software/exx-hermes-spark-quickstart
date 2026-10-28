@@ -191,15 +191,51 @@ if [[ -n "$dpol" ]]; then
     || warn "dashboard proxy restart" "'$dpol' -- re-run ./scripts/expose-dashboard.sh (or hermes-stack-restore)"
 fi
 
-# --- 6. desktop app config ---------------------------------------------------
-CONN="$HOME/.config/Hermes/connection.json"
-if [[ -f "$CONN" && -n "$tok" ]]; then
-  cur="$(python3 -c "import json;print(json.load(open('$CONN'))['remote']['token']['value'])" 2>/dev/null)"
-  [[ "$cur" == "$tok" ]] && pass "desktop token" "connection.json matches the live token" \
-                         || { warn "desktop token" "stale -- the app will say 'session expired'"; \
-                              printf '        %sFix: hermes-desktop-token-sync%s\n' "$DIM" "$OFF"; }
-elif [[ ! -f "$CONN" ]]; then
-  warn "desktop token" "no desktop app config at $CONN"
+# --- 6. desktop app ----------------------------------------------------------
+HROOT="${HERMES_HOST_ROOT:-$HOME/.hermes/hermes-agent}"
+# The token the app actually reads is connections.json (v2 store); connection.json
+# is the older file. Reading only the old one reported PASS while the app held a
+# stale token (2026-10-27).
+DCFG="${HERMES_DESKTOP_CONFIG_DIR:-$HOME/.config/Hermes}"
+if [[ -f "$DCFG/connection.json" || -f "$DCFG/connections.json" ]] && [[ -n "$tok" ]]; then
+  tstate="$(hermes_desktop_tokens_state "$tok" "$UI" "$DCFG/connections.json" "$DCFG/connection.json")"
+  bad="$(grep -vE ' ok$' <<<"$tstate" | sed 's#.*/##' | tr '\n' ' ')"
+  if [[ -n "$tstate" && -z "$bad" ]]; then
+    pass "desktop token" "$(sed 's#.*/##; s/ ok$//' <<<"$tstate" | paste -sd, | sed 's/,/ and /') match the live token"
+  else
+    warn "desktop token" "stale or missing in: ${bad:-none found} -- the app will say 'session expired'"
+    printf '        %sFix: hermes-desktop-token-sync%s\n' "$DIM" "$OFF"
+  fi
+elif [[ ! -f "$DCFG/connection.json" && ! -f "$DCFG/connections.json" ]]; then
+  warn "desktop token" "no desktop app config in $DCFG"
+fi
+
+# The client must be built from the ref that matches the sandbox's hermes: a
+# newer client sends fields the older gateway rejects ("title, preview: extra
+# inputs are not permitted") and every prompt fails.
+if [[ -d "$HROOT/.git" ]]; then
+  sbx_ver="$(docker exec "$C" hermes --version 2>/dev/null | head -1)"
+  want_tag="$(hermes_version_tag "$sbx_ver")"
+  want_commit=""; [[ -n "$want_tag" ]] && want_commit="$(git -C "$HROOT" rev-parse -q --verify "${want_tag}^{commit}" 2>/dev/null)"
+  built_commit="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('commit',''))" \
+                    "$HROOT/apps/desktop/build/install-stamp.json" 2>/dev/null)"
+  verdict "$(hermes_desktop_ref_verdict "${want_tag:-?}" "$want_commit" "$built_commit")" "desktop matches sandbox"
+
+  # Electron cannot start without its SUID helper where unprivileged user
+  # namespaces are restricted (the Ubuntu default).
+  if cs="$(hermes_chrome_sandbox_path "$HROOT")"; then
+    verdict "$(hermes_chrome_sandbox_verdict "$(stat -c '%U:%G' "$cs")" "$(stat -c '%a' "$cs")")" "desktop chrome-sandbox"
+  else
+    verdict "$(hermes_chrome_sandbox_verdict "" "")" "desktop chrome-sandbox"
+  fi
+
+  # The menu entry runs `hermes desktop`; the launcher must be the checkout's venv.
+  lt="$(readlink -f "$HOME/.local/bin/hermes" 2>/dev/null)"
+  if [[ "$lt" == "$(readlink -f "$HROOT/venv/bin/hermes" 2>/dev/null)" ]] && "$HOME/.local/bin/hermes" --version >/dev/null 2>&1; then
+    pass "hermes launcher" "~/.local/bin/hermes runs from the checkout venv"
+  else
+    fail "hermes launcher" "~/.local/bin/hermes is not the checkout's venv hermes (-> ${lt:-missing}); 'hermes desktop' may fail. Fix: ./scripts/install-hermes-host.sh"
+  fi
 fi
 
 # --- 7. reboot durability wiring --------------------------------------------

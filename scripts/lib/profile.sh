@@ -299,6 +299,10 @@ profile_validate() {
     *) _p_die "DASHBOARD_AUTH='$DASHBOARD_AUTH' is not valid (expected: none | basic)" ;;
   esac
 
+  case "${AGENT_THINKING:-default}" in
+    default|off) ;;
+    *) _p_die "AGENT_THINKING='$AGENT_THINKING' is not valid (expected: default | off)" ;;
+  esac
   local p
   for p in CONTROL_UI_PORT DASHBOARD_PUBLIC_PORT NEMOCLAW_GATEWAY_PORT; do
     [[ "${!p}" =~ ^[0-9]+$ ]] || _p_die "$p='${!p}' is not a number"
@@ -367,7 +371,7 @@ profile_print() {
            MAX_MODEL_LEN AGENT_MAX_TOKENS MEM_CAP GPU_MEMORY_UTILIZATION \
            VLLM_IMAGE VLLM_CONTAINER VLLM_PORT VLLM_EXTRA_ARGS SANDBOX_NAME \
            CONTROL_UI_PORT DASHBOARD_PUBLIC_PORT NEMOCLAW_GATEWAY_PORT \
-           DASHBOARD_AUTH DASHBOARD_AUTH_USER; do
+           DASHBOARD_AUTH DASHBOARD_AUTH_USER AGENT_THINKING; do
     [[ -n "${!k:-}" ]] && printf '  %-24s %s\n' "$k" "${!k}"
   done
   printf '\n-- host facts (detected on this machine) --\n'

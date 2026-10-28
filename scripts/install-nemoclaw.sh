@@ -55,24 +55,49 @@ command -v curl >/dev/null 2>&1 || die "curl is required to install NemoClaw"
 # It offers --non-interactive and --yes-i-accept-third-party-software, and it
 # would be easy to pass those always. We do not, on purpose: that would mean
 # this repo silently accepting NVIDIA's third-party software notice on someone
-# else's machine, which is not ours to do. Accepting is one explicit flag.
+# else's machine, which is not ours to do. Accepting is one explicit act:
+#   * at a terminal, a prompt -- "Accept? [y/N]" -- so the README command is the
+#     whole install (it used to stop here with exit 1, and the README never
+#     mentioned the flag that gets past it);
+#   * with no terminal (CI, ssh -T, a pipe), the flag, as before.
 if [[ "$ACCEPT_LICENSE" != 1 ]]; then
   printf '\n%s  NemoClaw requires accepting NVIDIA'"'"'s licence and third-party notice.%s\n' "$YEL" "$OFF" >&2
   cat >&2 <<'MSG'
 
     That notice covers software this installer RETRIEVES but does not
     distribute -- OpenClaw, OpenShell and container images -- each under its
-    own terms. Review it, then re-run with:
+    own terms.
+
+    Docs: https://build.nvidia.com/spark/nemoclaw/instructions
+MSG
+  if [[ -t 0 ]]; then
+    if hermes_licence_prompt; then
+      ACCEPT_LICENSE=1
+      echo >&2
+      note "accepted at the prompt"
+    else
+      cat >&2 <<'MSG'
+
+    Not accepted -- nothing was installed. Re-run when you are ready, or
+    install NemoClaw yourself first, interactively:
+
+        curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash
+MSG
+      exit 1
+    fi
+  else
+    cat >&2 <<'MSG'
+
+    No terminal to ask on. Review the notice, then re-run with:
 
         ./install.sh --profile <profile> --accept-nemoclaw-license
 
     Or install NemoClaw yourself first, interactively:
 
         curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash
-
-    Docs: https://build.nvidia.com/spark/nemoclaw/instructions
 MSG
-  exit 1
+    exit 1
+  fi
 fi
 
 # Kept although onboarding is now deferred (below): deferral is conditional,

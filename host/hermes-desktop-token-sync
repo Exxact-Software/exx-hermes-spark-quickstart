@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Keep the Hermes desktop app's connection.json in step with the container's
+# Keep the Hermes desktop app's connection files in step with the container's
 # dashboard session token.
+#
+# TWO files hold it, and the app reads the second one:
+#   ~/.config/Hermes/connection.json    older single-connection file
+#   ~/.config/Hermes/connections.json   the v2 store the app actually boots from
+#                                       (connections[] entry id 127-0-0-1-<port>)
+# Updating only connection.json left the app on a stale token ("session
+# expired") while this script and the healthcheck both reported success.
 #
 # Why this exists: the token is minted in-memory at
 # /opt/hermes/hermes_cli/web_server.py:281 as
@@ -34,11 +41,14 @@ if [ "$_hermes_common_loaded" = 0 ]; then
   }
 fi
 
-CONN="${HERMES_DESKTOP_CONN:-$HOME/.config/Hermes/connection.json}"
+CONN_DIR="${HERMES_DESKTOP_CONFIG_DIR:-$HOME/.config/Hermes}"
+CONN="${HERMES_DESKTOP_CONN:-$CONN_DIR/connection.json}"
+CONNS="${HERMES_DESKTOP_CONNS:-$CONN_DIR/connections.json}"
 URL="${HERMES_CONTROL_UI_URL:-http://127.0.0.1:18795}"
 TRIES="${HERMES_TOKEN_SYNC_TRIES:-60}"
 
-[[ -f "$CONN" ]] || { echo "no desktop config at $CONN -- nothing to sync" >&2; exit 0; }
+[[ -f "$CONN" || -f "$CONNS" ]] \
+  || { echo "no desktop config in $CONN_DIR -- nothing to sync" >&2; exit 0; }
 
 # Wait for the dashboard to actually answer. Poll the real endpoint, not a
 # container status: "Up" and "serving" are different things.
@@ -51,23 +61,43 @@ for _ in $(seq 1 "$TRIES"); do
 done
 [[ -n "$token" ]] || { echo "dashboard did not serve a token at $URL" >&2; exit 1; }
 
-# Only rewrite when it actually changed -- keeps the file's mtime meaningful.
-python3 - "$CONN" "$token" <<'PY'
-import json, sys, os, tempfile
-path, token = sys.argv[1], sys.argv[2]
-with open(path) as fh:
-    cfg = json.load(fh)
-current = cfg.get("remote", {}).get("token", {}).get("value")
-if current == token:
-    print("token unchanged -- no rewrite")
-    raise SystemExit(0)
-cfg.setdefault("remote", {}).setdefault("token", {})["value"] = token
-cfg["remote"]["token"].setdefault("encoding", "plain")
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
-with os.fdopen(fd, "w") as fh:
-    json.dump(cfg, fh, indent=2)
-os.replace(tmp, path)
-print(f"token updated: {(current or 'none')[:12]}... -> {token[:12]}...")
+# Only rewrite a file when its token actually changed -- keeps mtimes
+# meaningful and makes a second run a no-op. Only the entry for OUR url is
+# touched; every other connection in connections.json is preserved as it was.
+python3 - "$token" "$URL" "$CONN" "$CONNS" <<'PY'
+import json, os, sys, tempfile
+token, url = sys.argv[1], sys.argv[2].rstrip("/")
+for path in sys.argv[3:]:
+    if not os.path.exists(path):
+        continue
+    with open(path) as fh:
+        cfg = json.load(fh)
+    changed = []
+    def visit(o):
+        if isinstance(o, dict):
+            if str(o.get("url", "")).rstrip("/") == url and isinstance(o.get("token"), dict):
+                t = o["token"]
+                if t.get("value") != token:
+                    changed.append((t.get("value") or "none")[:12])
+                    t["value"] = token
+                    t.setdefault("encoding", "plain")
+            for v in list(o.values()):
+                visit(v)
+        elif isinstance(o, list):
+            for v in o:
+                visit(v)
+    visit(cfg)
+    name = os.path.basename(path)
+    if not changed:
+        print(f"{name}: token unchanged -- no rewrite")
+        continue
+    mode = os.stat(path).st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    print(f"{name}: token updated: {changed[0]}... -> {token[:12]}...")
 PY
 
 # Prove it, rather than assuming: the token must actually authenticate.

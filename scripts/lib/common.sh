@@ -294,3 +294,128 @@ hermes_gateway_verdict() {
 hermes_gateway_name_for_port() {
     [ "${1:?}" = 8080 ] && echo nemoclaw || echo "nemoclaw-$1"
 }
+
+# --- the desktop app must match the backend --------------------------------
+# The Desktop client is built from a host checkout of hermes-agent; the agent
+# itself runs INSIDE the sandbox at whatever version NemoClaw's image carries.
+# The two speak a versioned RPC and the gateway validates strictly: a client
+# built from upstream HEAD (v0.22.5) against a 0.21.3 sandbox sent
+# prompt.submit with extra fields (title, preview) and every prompt failed with
+# "invalid params ... Extra inputs are not permitted" (2026-10-27).
+#
+# So the checkout is pinned to the tag that matches the sandbox. Upstream tags
+# releases as v<date>, and `hermes --version` prints that date in brackets, so
+# the tag is derivable from the sandbox. At phase 1 no sandbox exists yet, so
+# this constant is the pin for the NemoClaw tag this repo installs (v0.0.137,
+# hermes 0.21.3). Change it together with NEMOCLAW_INSTALL_TAG.
+: "${HERMES_HOST_REF_PIN:=v2026.9.14}"
+
+#   hermes_version_tag "<hermes --version output>"  -> v2026.9.14, or nothing
+hermes_version_tag() {
+    local d
+    d="$(printf '%s\n' "${1:-}" | grep -oE '\(20[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,2}\)' | head -1 | tr -d '()')" || true
+    [ -n "$d" ] && printf 'v%s\n' "$d"
+    return 0
+}
+
+#   hermes_desktop_ref_verdict <want-tag> <want-commit> <built-commit>
+# <built-commit> is the commit the desktop build's install stamp recorded.
+hermes_desktop_ref_verdict() {
+    local tag="${1:-}" want="${2:-}" built="${3:-}"
+    if [ -z "$built" ]; then
+        echo "warn no desktop build stamp -- is the desktop client built? (./scripts/install-hermes-host.sh)"
+    elif [ -z "$want" ]; then
+        echo "warn cannot resolve ${tag:-the sandbox hermes tag} in the host checkout (git fetch --tags)"
+    elif [ "$built" = "$want" ]; then
+        echo "pass desktop built from ${tag} (${built:0:10}), matching the sandbox"
+    else
+        echo "fail desktop built from ${built:0:10} but the sandbox runs ${tag} (${want:0:10}) -- prompts will be rejected. Fix: ./scripts/install-hermes-host.sh --ref ${tag}"
+    fi
+}
+
+# Electron aborts at startup when kernel.apparmor_restrict_unprivileged_userns=1
+# (the Ubuntu default on a Spark) and its SUID sandbox helper is not root-owned
+# and setuid: "The SUID sandbox helper binary was found, but is not configured
+# correctly" (setuid_sandbox_host.cc). A fresh build leaves it as the user, 0755.
+#   hermes_chrome_sandbox_verdict <owner:group> <octal-mode>
+hermes_chrome_sandbox_verdict() {
+    if [ -z "${1:-}" ]; then
+        echo "warn no chrome-sandbox found -- desktop client not built"
+    elif [ "$1" = root:root ] && [ "${2:-}" = 4755 ]; then
+        echo "pass chrome-sandbox root:root 4755"
+    else
+        echo "fail chrome-sandbox is ${1} ${2:-?}, want root:root 4755 -- Electron will not start. Fix: sudo chown root:root <it> && sudo chmod 4755 <it>"
+    fi
+}
+
+#   hermes_chrome_sandbox_path <hermes-checkout-root> -> path of the helper, if built
+hermes_chrome_sandbox_path() {
+    local f
+    for f in "${1:?}"/apps/desktop/release/linux-*unpacked/chrome-sandbox; do
+        [ -e "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# Set the helper's ownership and mode. Tries passwordless sudo first, then an
+# interactive one when a terminal is attached. Returns non-zero when it could not.
+hermes_chrome_sandbox_fix() {
+    local f="${1:?}"
+    if sudo -n chown root:root "$f" 2>/dev/null && sudo -n chmod 4755 "$f" 2>/dev/null; then return 0; fi
+    if [ -t 0 ] || [ -r /dev/tty ]; then
+        sudo chown root:root "$f" && sudo chmod 4755 "$f" && return 0
+    fi
+    return 1
+}
+
+# Which desktop token file holds what. The app boots from connections.json (the
+# v2 store: a "connections" list, id 127-0-0-1-<port>); connection.json is the
+# older single-connection file. Both must carry the live token for OUR url.
+# Entries for other urls are not ours and are ignored. Prints one
+# "<file> <state>" line per file that exists, state = ok | stale | missing |
+# unreadable ("missing" = the file has no entry for this url).
+#   hermes_desktop_tokens_state <live-token> <control-ui-url> <file>...
+hermes_desktop_tokens_state() {
+    local tok="${1:?}" url="${2:?}"; shift 2
+    python3 - "$tok" "$url" "$@" <<'PY'
+import json, os, sys
+tok, url = sys.argv[1], sys.argv[2].rstrip("/")
+for path in sys.argv[3:]:
+    if not os.path.exists(path):
+        continue
+    try:
+        cfg = json.load(open(path))
+    except Exception:
+        print(f"{path} unreadable"); continue
+    vals = []
+    def walk(o):
+        if isinstance(o, dict):
+            t = o.get("token")
+            if str(o.get("url", "")).rstrip("/") == url and isinstance(t, dict) and isinstance(t.get("value"), str):
+                vals.append(t["value"])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(cfg)
+    state = "missing" if not vals else ("ok" if all(v == tok for v in vals) else "stale")
+    print(f"{path} {state}")
+PY
+}
+
+# --- the NemoClaw licence prompt --------------------------------------------
+# Asks on the terminal and returns 0 only for an explicit y / yes. Anything else
+# (a bare Enter, EOF, or no terminal at all) is "no": accepting a third-party
+# licence is not ours to do for the user. The prompt goes to stderr so it
+# survives an installer phase that tees stdout.
+hermes_licence_prompt() {
+    [ -t 0 ] || return 1
+    local ans=""
+    printf '\n    Accept? [y/N] ' >&2
+    IFS= read -r ans || return 1
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) return 0 ;;
+        *)     return 1 ;;
+    esac
+}

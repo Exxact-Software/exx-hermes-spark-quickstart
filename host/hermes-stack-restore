@@ -6,6 +6,7 @@
 #   - the two ssh forwards    (openshell ssh-proxy, orphaned to the user manager)
 #   - the Hermes agent INSIDE the sandbox -- see below
 #   - the desktop token       (rotates whenever the dashboard restarts)
+#   - the dashboard INSIDE the sandbox, after an unclean boot (see step 4)
 #   - the dashboard proxy, on installs made before it got a restart policy
 #   - the sandbox itself, on NemoClaw 0.0.137 -- restart policy 'no', and the
 #     nemoclaw-openshell-gateway user service starts the gateway, not sandboxes
@@ -88,6 +89,69 @@ echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 dashboard_ok() { curl -s --max-time 6 -H 'Host: localhost' "$UI/" 2>/dev/null | grep -q '__HERMES_SESSION_TOKEN__'; }
+
+# --- the processes INSIDE the sandbox --------------------------------------
+# After an unclean boot (power loss; hermes-sandbox-shutdown.service never ran)
+# the sandbox came back with the gateway only: nemoclaw-start logged "hermes
+# gateway launched" and never started the dashboard or either socat bridge, so
+# the host forward on :18795 had nothing behind it and every desktop request
+# timed out. `recover` does not start a missing dashboard, and the old step 4
+# gave up there (2026-10-27).
+#
+# So start what is missing, with the same arguments nemoclaw-start uses
+# (build_hermes_dashboard_args: dashboard --host 127.0.0.1 --port <internal>
+# --skip-build --no-open --isolated, in the agent's own HERMES_HOME), plus the
+# two 0.0.0.0 socat bridges it makes. Each piece is checked first and only
+# started when absent, so this is safe to run every 15 minutes from the heal
+# timer and does nothing when the stack is healthy.
+#
+# `openshell sandbox exec`, not `docker exec`: docker exec lands in the
+# container's network namespace, where the sandbox's 127.0.0.1 listeners do not
+# exist. stdin is closed because exec forwards it and would swallow a caller's.
+DASH_INTERNAL_PORT="${HERMES_DASHBOARD_INTERNAL_PORT:-19119}"
+UI_PORT="${UI##*:}"; UI_PORT="${UI_PORT%%/*}"
+API_PORT="${HERMES_API_PORT:-8642}"
+GW_INTERNAL_PORT="${HERMES_GATEWAY_INTERNAL_PORT:-18642}"
+SBX_HEAL_SCRIPT='
+dport=$1; pub=$2; api=$3; gwi=$4
+code() { curl -s -o /dev/null -w "%{http_code}" --max-time 4 "$1" 2>/dev/null; }
+if [ "$(code "http://127.0.0.1:$dport/api/status")" = 000 ]; then
+  # a listener that does not answer is wedged: replace it, do not stack another
+  for p in $(pgrep -f "[h]ermes.real dashboard"); do kill "$p" 2>/dev/null; done
+  sleep 1
+  HERMES_HOME=/sandbox/.hermes GATEWAY_HEALTH_URL="http://127.0.0.1:$gwi" \
+  NEMOCLAW_HERMES_DASHBOARD_API_SERVER_ENV=/sandbox/.hermes/.env \
+  _NEMOCLAW_HERMES_DASHBOARD_EXTERNAL_HOST= \
+    nohup /usr/local/bin/hermes dashboard --host 127.0.0.1 --port "$dport" \
+      --skip-build --no-open --isolated >>/tmp/dashboard.log 2>&1 </dev/null &
+  echo "dashboard started"
+  for _ in $(seq 1 45); do
+    [ "$(code "http://127.0.0.1:$dport/api/status")" != 000 ] && break
+    sleep 2
+  done
+fi
+if ! pgrep -f "[T]CP-LISTEN:$pub," >/dev/null; then
+  nohup socat "TCP-LISTEN:$pub,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$dport" >/dev/null 2>&1 </dev/null &
+  echo "dashboard bridge $pub started"
+fi
+if ! pgrep -f "[T]CP-LISTEN:$api," >/dev/null; then
+  nohup socat "TCP-LISTEN:$api,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$gwi" >/dev/null 2>&1 </dev/null &
+  echo "API bridge $api started"
+fi
+sleep 1
+echo "dashboard $(code "http://127.0.0.1:$dport/api/status")"
+'
+sandbox_heal() {
+  local out
+  out="$(timeout 180 openshell sandbox exec -n "$SANDBOX" --no-tty -- \
+          sh -c "$SBX_HEAL_SCRIPT" sh "$DASH_INTERNAL_PORT" "$UI_PORT" "$API_PORT" "$GW_INTERNAL_PORT" \
+          </dev/null 2>&1)" || { log "warn: could not run the in-sandbox repair: ${out:0:200}"; return 1; }
+  local l
+  while IFS= read -r l; do
+    case "$l" in *started*) log "in-sandbox: $l" ;; esac
+  done <<<"$out"
+  return 0
+}
 
 model_ok() { curl -sSf --max-time 5 "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null 2>&1; }
 
@@ -189,11 +253,14 @@ done
 model_ok && log "model serving" || log "warn: model still not serving"
 
 # 4. Forwards + agent, judged ONLY by whether the dashboard actually answers.
+# First make sure the processes inside the sandbox exist (see sandbox_heal): a
+# healthy sandbox is a no-op here, an unclean boot is repaired here.
+sandbox_heal || true
 if dashboard_ok; then
   log "dashboard already answering"
 else
   log "dashboard not answering -- rebuilding forwards"
-  for port in 18795 8642; do
+  for port in "$UI_PORT" "$API_PORT"; do
     timeout 60 openshell forward stop "$port" "$SANDBOX" >/dev/null 2>&1 || true
     timeout 120 openshell forward start --background "$port" "$SANDBOX" >/dev/null 2>&1 \
       || log "warn: forward $port did not start"
@@ -201,11 +268,13 @@ else
   sleep 5
 
   # Still dead? Then the agent inside the sandbox is not running. The container
-  # coming back does NOT restart Hermes; `recover` is the sanctioned repair.
+  # coming back does NOT restart Hermes; `recover` is the sanctioned repair, and
+  # the in-sandbox repair runs again after it for whatever recover leaves out.
   if ! dashboard_ok; then
     log "still dead -- running 'nemohermes $SANDBOX recover'"
     timeout 600 nemohermes "$SANDBOX" recover >/dev/null 2>&1 || log "warn: recover reported problems"
-    for port in 18795 8642; do
+    sandbox_heal || true
+    for port in "$UI_PORT" "$API_PORT"; do
       timeout 60 openshell forward stop "$port" "$SANDBOX" >/dev/null 2>&1 || true
       timeout 120 openshell forward start --background "$port" "$SANDBOX" >/dev/null 2>&1 || true
     done

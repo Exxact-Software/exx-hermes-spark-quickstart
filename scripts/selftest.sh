@@ -1001,6 +1001,243 @@ grep -qE "${_hp}\|" <<<'openshell-default--sb-f6f0a0ca-67a9-48bf-9513-c09661ce46
   || fail "healthcheck container match" "pattern or gateway check wrong"
 kill "$_lsn_pid" 2>/dev/null; wait "$_lsn_pid" 2>/dev/null
 
+# --- 9. v1.1: desktop pinned to the sandbox's Hermes -------------------------
+# A client built from upstream HEAD (v0.22.5) against a 0.21.3 sandbox sent
+# prompt.submit with extra fields and every prompt failed. Behavioural test
+# against a throwaway local "upstream": the checkout must land on the TAG, not
+# the tip, and must be re-pinned on a re-run even though `hermes` now exists.
+. scripts/lib/common.sh
+[[ "$(hermes_version_tag 'Hermes Agent v0.21.3 (2026.9.14)')" == v2026.9.14 ]] \
+  && [[ -z "$(hermes_version_tag 'Hermes Agent v0.21.3')" ]] \
+  && pass "hermes tag from version" "(2026.9.14) -> v2026.9.14; none when absent" \
+  || fail "hermes tag from version" "wrong tag derivation"
+[[ "$HERMES_HOST_REF_PIN" =~ ^v20[0-9]{2}\.[0-9]+\.[0-9]+$ ]] \
+  && pass "pin is a release tag" "$HERMES_HOST_REF_PIN" || fail "pin is a release tag" "HERMES_HOST_REF_PIN='$HERMES_HOST_REF_PIN'"
+
+UP="$WORK/pin/upstream"; mkdir -p "$UP" "$WORK/pin/home" "$WORK/pin/bin"
+( cd "$UP" && git init -q . && git config user.email t@t && git config user.name t
+  cat > setup-hermes.sh <<'SETUP'
+#!/usr/bin/env bash
+mkdir -p venv/bin
+printf '#!/bin/sh\necho "Hermes Agent v0.21.3 (2026.9.14)"\n' > venv/bin/hermes
+printf '#!/bin/sh\nexit 0\n' > venv/bin/python
+chmod +x venv/bin/hermes venv/bin/python
+SETUP
+  chmod +x setup-hermes.sh; echo one > f; git add -A; git commit -qm one; git tag v2026.9.14
+  echo two > f; git commit -qam two ) >/dev/null 2>&1
+PIN_ENV=(env -i HOME="$WORK/pin/home" PATH="$WORK/pin/bin:/usr/bin:/bin" HERMES_UPSTREAM="$UP"
+         HERMES_HOST_ROOT="$WORK/pin/root" HERMES_SANDBOX_NAME=selftest-none)
+"${PIN_ENV[@]}" ./scripts/install-hermes-host.sh --skip-desktop >"$WORK/pin/run1.log" 2>&1
+tag_sha="$(git -C "$UP" rev-parse v2026.9.14^{commit})"; tip_sha="$(git -C "$UP" rev-parse HEAD)"
+[[ "$(git -C "$WORK/pin/root" rev-parse HEAD 2>/dev/null)" == "$tag_sha" && "$tag_sha" != "$tip_sha" ]] \
+  && pass "host checkout pinned" "fresh install lands on the tag, not upstream tip" \
+  || fail "host checkout pinned" "HEAD=$(git -C "$WORK/pin/root" rev-parse --short HEAD 2>/dev/null) want ${tag_sha:0:7}; $(tail -3 "$WORK/pin/run1.log")"
+# the launcher must be the checkout venv's hermes ("No module named 'yaml'")
+[[ "$(readlink -f "$WORK/pin/home/.local/bin/hermes" 2>/dev/null)" == "$(readlink -f "$WORK/pin/root/venv/bin/hermes")" ]] \
+  && pass "launcher is the venv hermes" "~/.local/bin/hermes -> checkout venv/bin/hermes" \
+  || fail "launcher is the venv hermes" "$(readlink -f "$WORK/pin/home/.local/bin/hermes" 2>&1)"
+# a re-run, with hermes already installed and the checkout moved off the tag
+git -C "$WORK/pin/root" checkout -q "$tip_sha" 2>/dev/null
+PIN_ENV2=(env -i HOME="$WORK/pin/home" PATH="$WORK/pin/home/.local/bin:$WORK/pin/bin:/usr/bin:/bin" HERMES_UPSTREAM="$UP"
+          HERMES_HOST_ROOT="$WORK/pin/root" HERMES_SANDBOX_NAME=selftest-none)
+"${PIN_ENV2[@]}" ./scripts/install-hermes-host.sh --skip-desktop >"$WORK/pin/run2.log" 2>&1
+[[ "$(git -C "$WORK/pin/root" rev-parse HEAD)" == "$tag_sha" ]] \
+  && pass "re-run re-pins" "checkout moved off the tag goes back, though hermes already exists" \
+  || fail "re-run re-pins" "$(tail -3 "$WORK/pin/run2.log")"
+"${PIN_ENV[@]}" ./scripts/install-hermes-host.sh --skip-desktop --ref "$tip_sha" >/dev/null 2>&1
+[[ "$(git -C "$WORK/pin/root" rev-parse HEAD)" == "$tip_sha" ]] \
+  && pass "--ref overrides the pin" "explicit ref wins" || fail "--ref overrides the pin" "ignored"
+# desktop build verdict: compares the stamp commit with the tag's commit
+[[ "$(hermes_desktop_ref_verdict v2026.9.14 aaaa1111 aaaa1111)" == pass* \
+   && "$(hermes_desktop_ref_verdict v2026.9.14 aaaa1111 bbbb2222)" == fail* \
+   && "$(hermes_desktop_ref_verdict v2026.9.14 aaaa1111 '')" == warn* ]] \
+  && pass "desktop/sandbox verdict" "match passes, mismatch fails, no stamp warns" \
+  || fail "desktop/sandbox verdict" "verdicts wrong"
+grep -q '"desktop matches sandbox"' scripts/healthcheck.sh && grep -q 'install-stamp.json' scripts/healthcheck.sh \
+  && pass "healthcheck: desktop ref" "compares the build stamp with the sandbox version" \
+  || fail "healthcheck: desktop ref" "check missing"
+grep -q 'venv/bin/python -m hermes_cli.main desktop --build-only --force-build' scripts/install-hermes-host.sh \
+  && pass "desktop built from the venv" "checkout venv python, forced rebuild" \
+  || fail "desktop built from the venv" "builds with whatever hermes is on PATH"
+
+# --- 9b. chrome-sandbox setuid -------------------------------------------------
+# Without root:root 4755 Electron aborts where unprivileged userns is restricted.
+[[ "$(hermes_chrome_sandbox_verdict root:root 4755)" == pass* \
+   && "$(hermes_chrome_sandbox_verdict exx:exx 755)" == fail* \
+   && "$(hermes_chrome_sandbox_verdict root:root 755)" == fail* \
+   && "$(hermes_chrome_sandbox_verdict '' '')" == warn* ]] \
+  && pass "chrome-sandbox verdict" "only root:root 4755 passes" || fail "chrome-sandbox verdict" "verdicts wrong"
+mkdir -p "$WORK/cs/apps/desktop/release/linux-arm64-unpacked"; : > "$WORK/cs/apps/desktop/release/linux-arm64-unpacked/chrome-sandbox"
+[[ "$(hermes_chrome_sandbox_path "$WORK/cs")" == "$WORK/cs/apps/desktop/release/linux-arm64-unpacked/chrome-sandbox" ]] \
+  && ! hermes_chrome_sandbox_path "$WORK/none" >/dev/null \
+  && pass "chrome-sandbox located" "finds the unpacked helper, none when unbuilt" || fail "chrome-sandbox located" "path lookup wrong"
+grep -q 'hermes_chrome_sandbox_fix' scripts/install-hermes-host.sh && grep -q '"desktop chrome-sandbox"' scripts/healthcheck.sh \
+  && pass "chrome-sandbox set + checked" "installer fixes it after every build; healthcheck reads it" \
+  || fail "chrome-sandbox set + checked" "installer or healthcheck lacks it"
+
+# --- 9c. token sync: both files, idempotent, others preserved --------------------
+cat > "$WORK/dash.py" <<'PY'
+import http.server, sys
+TOK = "live-token-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/api/sessions"):
+            ok = self.headers.get("Authorization") == "Bearer " + TOK
+            self.send_response(200 if ok else 401); self.end_headers(); self.wfile.write(b"[]"); return
+        self.send_response(200); self.end_headers()
+        self.wfile.write(('<script>window.__HERMES_SESSION_TOKEN__="%s";</script>' % TOK).encode())
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+python3 "$WORK/dash.py" > "$WORK/dash.port" 2>/dev/null & _dash_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$WORK/dash.port" ]] && break; sleep 0.3; done
+DPORT="$(cat "$WORK/dash.port")"; DURL="http://127.0.0.1:$DPORT"
+mkdir -p "$WORK/hc"
+cat > "$WORK/hc/connection.json" <<EOF
+{"mode":"remote","remote":{"url":"$DURL","authMode":"token","token":{"encoding":"plain","value":"OLD-1"}},"profiles":{}}
+EOF
+cat > "$WORK/hc/connections.json" <<EOF
+{"version":2,"primary":"mine","connections":[{"id":"local","kind":"local","label":"This device"},{"id":"mine","kind":"remote","url":"$DURL","authMode":"token","token":{"encoding":"plain","value":"OLD-2"}},{"id":"other","kind":"remote","url":"http://other.example:9","authMode":"token","token":{"encoding":"plain","value":"OTHER-KEEP"}}]}
+EOF
+SYNC=(env HERMES_DESKTOP_CONFIG_DIR="$WORK/hc" HERMES_CONTROL_UI_URL="$DURL" HERMES_TOKEN_SYNC_TRIES=2 ./host/hermes-desktop-token-sync)
+LIVE="live-token-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+st0="$(hermes_desktop_tokens_state "$LIVE" "$DURL" "$WORK/hc/connections.json" "$WORK/hc/connection.json" | sed 's#.*/##' | tr '\n' ';')"
+"${SYNC[@]}" >"$WORK/hc/run1.log" 2>&1
+m1="$(stat -c %Y.%y "$WORK/hc/connection.json" "$WORK/hc/connections.json" | tr '\n' ' ')"
+sleep 1.1
+"${SYNC[@]}" >"$WORK/hc/run2.log" 2>&1
+m2="$(stat -c %Y.%y "$WORK/hc/connection.json" "$WORK/hc/connections.json" | tr '\n' ' ')"
+st1="$(hermes_desktop_tokens_state "$LIVE" "$DURL" "$WORK/hc/connections.json" "$WORK/hc/connection.json" | sed 's#.*/##' | tr '\n' ';')"
+python3 - "$WORK/hc" "$LIVE" "$DURL" <<'PY' && tk=1 || tk=0
+import json, sys
+d, live, url = sys.argv[1:4]
+a = json.load(open(d + "/connection.json")); b = json.load(open(d + "/connections.json"))
+ents = {c["id"]: c for c in b["connections"]}
+assert a["remote"]["token"]["value"] == live
+assert ents["mine"]["token"]["value"] == live
+assert ents["other"]["token"]["value"] == "OTHER-KEEP", "other entry changed"
+assert ents["local"] == {"id": "local", "kind": "local", "label": "This device"}
+assert b["primary"] == "mine" and b["version"] == 2
+PY
+[[ "$st0" == "connections.json stale;connection.json stale;" ]] && [[ "$st1" == "connections.json ok;connection.json ok;" ]] \
+  && pass "token state reads both files" "stale before sync, ok after; healthcheck would see connections.json" \
+  || fail "token state reads both files" "before: $st0 after: $st1"
+(( tk )) && pass "token-sync updates both" "connection.json and connections.json carry the live token; other entries kept" \
+         || fail "token-sync updates both" "$(cat "$WORK/hc/run1.log")"
+[[ "$m1" == "$m2" ]] && grep -q 'token unchanged' "$WORK/hc/run2.log" \
+  && pass "token-sync idempotent" "second run rewrites nothing" \
+  || fail "token-sync idempotent" "mtimes changed or no 'unchanged': $(cat "$WORK/hc/run2.log")"
+grep -q 'hermes_desktop_tokens_state' scripts/healthcheck.sh && grep -q 'connections.json' scripts/healthcheck.sh \
+  && pass "healthcheck: connections.json" "desktop-token check reads the file the app reads" \
+  || fail "healthcheck: connections.json" "still reads connection.json only"
+kill "$_dash_pid" 2>/dev/null; wait "$_dash_pid" 2>/dev/null
+
+# --- 9d. dashboard after an unclean boot: the restore starts what is missing -----
+# The in-sandbox repair script, run against stubbed tools: it must start the
+# dashboard (nemoclaw-start's argv) and both bridges when absent, and start
+# NOTHING when they are all there.
+sed -n "/^SBX_HEAL_SCRIPT='/,/^'\$/p" host/hermes-stack-restore | sed '1d;$d' > "$WORK/heal.sh"
+mkdir -p "$WORK/stub"
+cat > "$WORK/stub/curl" <<'STUB'
+#!/bin/sh
+case "$*" in *19119*) printf '%s' "${FAKE_DASH_CODE:-000}" ;; *) printf 000 ;; esac
+STUB
+cat > "$WORK/stub/pgrep" <<'STUB'
+#!/bin/sh
+# usage: pgrep -f <pattern>; the "processes" are the lines of $FAKE_PROCS
+for pat in "$@"; do :; done
+grep -E -- "$(printf '%s' "$pat" | sed 's/\[\(.\)\]/\1/g')" "$FAKE_PROCS" 2>/dev/null | cut -d' ' -f1
+[ -s "$FAKE_PROCS" ] && grep -qE -- "$(printf '%s' "$pat" | sed 's/\[\(.\)\]/\1/g')" "$FAKE_PROCS"
+STUB
+printf '#!/bin/sh\necho "nohup $*" >> "$FAKE_LOG"\n' > "$WORK/stub/nohup"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/stub/sleep"; printf '#!/bin/sh\necho "kill $*" >> "$FAKE_LOG"\n' > "$WORK/stub/kill"
+chmod +x "$WORK/stub/"*
+heal() { # <dash code> <procs...>  -> prints what the script started
+  : > "$WORK/heal.log"; printf '%s\n' "${@:2}" > "$WORK/heal.procs"
+  PATH="$WORK/stub:/usr/bin:/bin" FAKE_LOG="$WORK/heal.log" FAKE_PROCS="$WORK/heal.procs" FAKE_DASH_CODE="$1" \
+    sh "$WORK/heal.sh" 19119 18795 8642 18642 2>&1 | grep started | tr '\n' ';'
+}
+h_none="$(heal 000 '')"; h_all="$(heal 200 '1 TCP-LISTEN:18795,bind' '2 TCP-LISTEN:8642,bind')"; h_api="$(heal 200 '1 TCP-LISTEN:18795,bind')"
+grep -q 'nohup /usr/local/bin/hermes dashboard --host 127.0.0.1 --port 19119 --skip-build --no-open --isolated' "$WORK/heal.log" 2>/dev/null; had_argv=$?
+[[ "$h_none" == *"dashboard started"*"dashboard bridge 18795 started"*"API bridge 8642 started"* ]] \
+  && pass "restore: starts a missing dashboard" "dashboard + 18795 bridge + 8642 bridge all started when absent" \
+  || fail "restore: starts a missing dashboard" "got: $h_none"
+h_none2="$(heal 000 '')"; grep -q -- '--skip-build --no-open --isolated' "$WORK/heal.log" \
+  && pass "restore: nemoclaw-start's args" "dashboard --host 127.0.0.1 --port 19119 --skip-build --no-open --isolated" \
+  || fail "restore: nemoclaw-start's args" "$(cat "$WORK/heal.log")"
+[[ -z "$h_all" ]] && pass "restore: idempotent" "starts nothing when dashboard and both bridges are up" \
+                  || fail "restore: idempotent" "started: $h_all"
+[[ "$h_api" == "API bridge 8642 started;" ]] \
+  && pass "restore: restarts a missing 8642 bridge" "only the API socat is started" \
+  || fail "restore: restarts a missing 8642 bridge" "got: $h_api"
+# order inside step 4: repair before judging, and again after `recover`
+_ln_heal1="$(grep -n '^sandbox_heal || true' host/hermes-stack-restore | head -1 | cut -d: -f1)"
+_ln_rec="$(grep -n 'recover' host/hermes-stack-restore | grep -n 'timeout 600' | head -1 | cut -d: -f1)"
+(( $(grep -c '^\s*sandbox_heal || true' host/hermes-stack-restore) >= 2 )) && grep -q 'openshell sandbox exec' host/hermes-stack-restore \
+  && ! grep -q 'docker exec .*dashboard' host/hermes-stack-restore \
+  && pass "restore: heal before and after recover" "runs via openshell sandbox exec (the sandbox's own network namespace)" \
+  || fail "restore: heal before and after recover" "sandbox_heal not wired in twice, or uses docker exec"
+grep -q 'ExecStart=/usr/bin/systemctl --user restart hermes-stack-restore.service' host/hermes-stack-heal.service \
+  && pass "heal timer reaches the repair" "timer -> restarts the restore, which now starts the dashboard" \
+  || fail "heal timer reaches the repair" "timer no longer restarts the restore unit"
+
+# --- 9e. NemoClaw licence: prompt at a terminal, flag without one -------------------
+mkdir -p "$WORK/lic/home" "$WORK/lic/bin"
+LIC_OUT="$(env -i HOME="$WORK/lic/home" PATH="$WORK/lic/bin:/usr/bin:/bin" ./scripts/install-nemoclaw.sh </dev/null 2>&1; echo "rc=$?")"
+[[ "$LIC_OUT" == *"rc=1"* && "$LIC_OUT" == *"--accept-nemoclaw-license"* && "$LIC_OUT" == *"No terminal"* ]] \
+  && pass "licence: no terminal needs the flag" "exits 1 and names --accept-nemoclaw-license" \
+  || fail "licence: no terminal needs the flag" "$LIC_OUT"
+if command -v script >/dev/null 2>&1; then
+  ask() { printf '%s\n' "$1" | script -qec ". scripts/lib/common.sh; hermes_licence_prompt" /dev/null >/dev/null 2>&1; echo $?; }
+  [[ "$(ask y)" == 0 && "$(ask YES)" == 0 && "$(ask n)" == 1 && "$(ask '')" == 1 && "$(ask maybe)" == 1 ]] \
+    && pass "licence: prompt at a terminal" "y/yes accept; n, Enter and anything else decline" \
+    || fail "licence: prompt at a terminal" "y=$(ask y) YES=$(ask YES) n=$(ask n) enter=$(ask '') maybe=$(ask maybe)"
+  DECL="$(printf 'n\n' | script -qec "env -i HOME=$WORK/lic/home PATH=$WORK/lic/bin:/usr/bin:/bin ./scripts/install-nemoclaw.sh; echo rc=\$?" /dev/null 2>&1)"
+  [[ "$DECL" == *"Accept? [y/N]"* && "$DECL" == *"Not accepted"* && "$DECL" == *"rc=1"* ]] \
+    && pass "licence: declined at the prompt" "shows the notice, asks, exits 1 without installing" \
+    || fail "licence: declined at the prompt" "$DECL"
+else
+  pass "licence: prompt at a terminal" "skipped (no script(1) to fake a terminal)"
+fi
+grep -q 'accept-nemoclaw-license' README.md \
+  && pass "licence: README documents the flag" "--accept-nemoclaw-license is in the README" \
+  || fail "licence: README documents the flag" "README never mentions it"
+
+# --- 9f. thinking off for the demo profile -------------------------------------------
+# Server-side, via vLLM, because the sandbox config is sealed.
+OUTV="$(./install.sh --profile profiles/spark-video.conf --print-config 2>&1 | strip)"
+OUTQ="$(./install.sh --profile profiles/spark-qwen38.conf --print-config 2>&1 | strip)"
+grep -qE '^\s*AGENT_THINKING\s+off\s*$' <<<"$OUTV" && ! grep -q 'AGENT_THINKING' <<<"$OUTQ" \
+  && pass "thinking: demo profile only" "spark-video sets AGENT_THINKING=off; spark-qwen38 does not" \
+  || fail "thinking: demo profile only" "video: $(grep AGENT_THINKING <<<"$OUTV") qwen: $(grep AGENT_THINKING <<<"$OUTQ")"
+grep -rq 'AGENT_THINKING' profiles/spark-gemma26.conf && fail "thinking: other profiles untouched" "gemma26 sets it" \
+  || pass "thinking: other profiles untouched" "only the demo profile"
+sed 's/^AGENT_THINKING=.*/AGENT_THINKING=sometimes/' profiles/spark-video.conf > "$WORK/bad-think.conf"
+./install.sh --profile "$WORK/bad-think.conf" --print-config >/dev/null 2>&1 \
+  && fail "thinking: bad value rejected" "AGENT_THINKING=sometimes accepted" \
+  || pass "thinking: bad value rejected" "only default | off"
+# What the launch really passes: run launch_vllm's argument building with docker stubbed.
+sed -n '/^launch_vllm() {/,/^}/p' scripts/start-model.sh > "$WORK/launch.sh"
+docker() { printf '%s\n' "$@" > "$WORK/docker.args"; }
+(  AGENT_THINKING=off; VLLM_CONTAINER=c SERVED_MODEL_NAME=m MAX_MODEL_LEN=65536 GPU_MEMORY_UTILIZATION=.5 MEM_CAP=1g
+   VLLM_PORT=8000 MODEL_DIR=/m VLLM_IMAGE=img TOOL_CALL_PARSER=qwen3_coder VLLM_EXTRA_ARGS='--reasoning-parser qwen3' HOME=/h
+   . "$WORK/launch.sh"; launch_vllm ) >/dev/null 2>&1
+if grep -qx -- '--default-chat-template-kwargs' "$WORK/docker.args" && grep -qxF -- '{"enable_thinking": false}' "$WORK/docker.args" \
+   && grep -qx -- '--reasoning-parser' "$WORK/docker.args"; then
+  pass "thinking: vLLM launch flag" "AGENT_THINKING=off adds --default-chat-template-kwargs {enable_thinking:false}, keeps the reasoning parser"
+else
+  fail "thinking: vLLM launch flag" "$(cat "$WORK/docker.args" 2>&1 | tr '\n' ' ')"
+fi
+(  AGENT_THINKING=default; VLLM_CONTAINER=c SERVED_MODEL_NAME=m MAX_MODEL_LEN=65536 GPU_MEMORY_UTILIZATION=.5 MEM_CAP=1g
+   VLLM_PORT=8000 MODEL_DIR=/m VLLM_IMAGE=img TOOL_CALL_PARSER=qwen3_coder VLLM_EXTRA_ARGS='' HOME=/h
+   . "$WORK/launch.sh"; launch_vllm ) >/dev/null 2>&1
+grep -q 'enable_thinking' "$WORK/docker.args" \
+  && fail "thinking: default leaves vLLM alone" "flag present with AGENT_THINKING=default" \
+  || pass "thinking: default leaves vLLM alone" "no flag unless the profile asks"
+unset -f docker
+
 # --- 8. every script parses -------------------------------------------------
 for f in install.sh scripts/*.sh scripts/lib/*.sh host/hermes-stack-restore host/hermes-desktop-token-sync host/hermes-sandbox-stop; do
   bash -n "$f" 2>/dev/null && pass "parses" "$f" || fail "parses" "$f"

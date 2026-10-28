@@ -8,7 +8,11 @@
 # command in, one command out. So it installs that too, rather than leaving a
 # prerequisite in the README for a viewer to get wrong.
 #
-# Idempotent: if a working `hermes` CLI is already present this exits early.
+# Idempotent. The checkout is ALWAYS brought to the ref that matches the
+# sandbox (see HERMES_HOST_REF_PIN in scripts/lib/common.sh), even when a
+# working `hermes` already exists: a desktop client built from upstream HEAD
+# runs ahead of the sandbox's gateway and every prompt is rejected. The desktop
+# build is redone whenever it was not built from that ref.
 # Nothing here touches the container or /sandbox/.hermes, so it cannot affect
 # the config seal.
 set -euo pipefail
@@ -28,29 +32,60 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if command -v hermes >/dev/null 2>&1 && hermes --version >/dev/null 2>&1; then
+# Which ref? Explicit --ref wins. Then the version of the sandbox that is
+# already running (a re-run), because that is the thing the client must match.
+# Then the pin, for a first install where the sandbox does not exist yet.
+SANDBOX_NAME_FOR_REF="${HERMES_SANDBOX_NAME:-${SANDBOX_NAME:-hermes-demo}}"
+if [[ -z "$REF" && -n "${HERMES_HOST_REF:-}" ]]; then REF="$HERMES_HOST_REF"; fi
+if [[ -z "$REF" ]]; then
+  _sc="$(docker ps --format '{{.Names}}' 2>/dev/null \
+          | grep -E "^openshell-(.+--)?${SANDBOX_NAME_FOR_REF}-[0-9a-f-]{36}\$" | head -1)" || true
+  if [[ -n "$_sc" ]]; then
+    REF="$(hermes_version_tag "$(docker exec "$_sc" hermes --version 2>/dev/null)")" || true
+    [[ -n "$REF" ]] && note "sandbox hermes version says the client must be built from $REF"
+  fi
+fi
+[[ -n "$REF" ]] || REF="$HERMES_HOST_REF_PIN"
+
+command -v git >/dev/null 2>&1 || die "git is required"
+HAVE_CHECKOUT=0; [[ -d "$ROOT/.git" ]] && HAVE_CHECKOUT=1
+HAVE_HERMES=0
+if command -v hermes >/dev/null 2>&1 && hermes --version >/dev/null 2>&1; then HAVE_HERMES=1; fi
+
+if (( HAVE_HERMES && ! HAVE_CHECKOUT )); then
+  # Somebody's own Hermes, installed elsewhere. Not ours to re-pin.
   ok "hermes already installed ($(hermes --version 2>/dev/null | head -1))"
+  note "not a checkout under $ROOT, so it is left as it is."
   note "remove it first if you want a clean install: ./scripts/uninstall-hermes-host.sh"
+  ROOT_OWNED=0
 else
-  command -v git >/dev/null 2>&1 || die "git is required"
-  if [[ -d "$ROOT/.git" ]]; then
+  ROOT_OWNED=1
+  if (( HAVE_CHECKOUT )); then
     note "checkout exists, fetching"
-    git -C "$ROOT" fetch --quiet origin || die "could not fetch $UPSTREAM"
+    git -C "$ROOT" fetch --quiet --tags origin || die "could not fetch $UPSTREAM"
   else
     mkdir -p "$(dirname "$ROOT")"
     echo "==> cloning Hermes Agent (this is a large repo; several minutes)"
     git clone --quiet "$UPSTREAM" "$ROOT" || die "clone failed: $UPSTREAM"
   fi
-  [[ -n "$REF" ]] && { git -C "$ROOT" checkout --quiet "$REF" || die "no such ref: $REF"; note "pinned to $REF"; }
+  PREV_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  git -C "$ROOT" checkout --quiet "$REF" || die "no such ref: $REF"
+  note "pinned to $REF -- matches the sandbox, so the desktop client speaks its RPC"
+  NEW_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
   ok "source at $ROOT ($(git -C "$ROOT" rev-parse --short HEAD))"
 
-  echo "==> running Hermes' own setup (venv + dependencies + CLI symlink)"
-  # Its EXIT CODE is deliberately ignored. setup-hermes.sh installs correctly and
-  # then runs an OPTIONAL configuration wizard, which detects no TTY under an
-  # installer and exits non-zero -- after printing "✓ Setup complete!". Trusting
-  # the status code here reported a perfectly good install as a failure.
-  # Judge by the outcome instead: is there a working `hermes` on PATH.
-  ( cd "$ROOT" && ./setup-hermes.sh </dev/null ) >"$HERMES_LOG_DIR"/hermes-host-setup.log 2>&1 || true
+  # setup-hermes.sh builds the venv the CLI runs from. Run it on a fresh
+  # checkout AND whenever the ref moved: after a switch to an older ref the
+  # launcher failed with "No module named 'yaml'" until setup ran again.
+  if (( ! HAVE_HERMES )) || [[ "$PREV_HEAD" != "$NEW_HEAD" ]] || [[ ! -x "$ROOT/venv/bin/hermes" ]]; then
+    echo "==> running Hermes' own setup (venv + dependencies + CLI symlink)"
+    # Its EXIT CODE is deliberately ignored. setup-hermes.sh installs correctly and
+    # then runs an OPTIONAL configuration wizard, which detects no TTY under an
+    # installer and exits non-zero -- after printing "✓ Setup complete!". Trusting
+    # the status code here reported a perfectly good install as a failure.
+    # Judge by the outcome instead: is there a working `hermes` on PATH.
+    ( cd "$ROOT" && ./setup-hermes.sh </dev/null ) >"$HERMES_LOG_DIR"/hermes-host-setup.log 2>&1 || true
+  fi
   export PATH="$HOME/.local/bin:$PATH"
   hash -r 2>/dev/null || true
 
@@ -61,13 +96,21 @@ else
   # else's installer lost it, repair the outcome: we know where the real script
   # is. Same rule as everywhere else here -- do not trust the claim, check the
   # result, and fix it if it is wrong.
-  if ! command -v hermes >/dev/null 2>&1; then
-    if [[ -x "$ROOT/hermes" ]]; then
-      install -d "$HOME/.local/bin"
-      ln -sfn "$ROOT/hermes" "$HOME/.local/bin/hermes"
-      hash -r 2>/dev/null || true
-      note "setup did not leave a usable symlink; linked $ROOT/hermes -> ~/.local/bin/hermes"
-    fi
+  #
+  # The launcher must be the CHECKOUT'S VENV hermes. A generated launcher that
+  # runs a bare `python -I` has no PyYAML: after a ref switch it failed with
+  # "No module named 'yaml'" and the desktop menu entry (which runs
+  # `hermes desktop`) would not start. The venv script is what setup-hermes.sh
+  # intends, so point at it whenever it exists.
+  if [[ -x "$ROOT/venv/bin/hermes" ]]; then
+    install -d "$HOME/.local/bin"
+    ln -sfn "$ROOT/venv/bin/hermes" "$HOME/.local/bin/hermes"
+    hash -r 2>/dev/null || true
+  elif ! command -v hermes >/dev/null 2>&1 && [[ -x "$ROOT/hermes" ]]; then
+    install -d "$HOME/.local/bin"
+    ln -sfn "$ROOT/hermes" "$HOME/.local/bin/hermes"
+    hash -r 2>/dev/null || true
+    note "setup did not leave a usable symlink; linked $ROOT/hermes -> ~/.local/bin/hermes"
   fi
 
   if ! command -v hermes >/dev/null 2>&1 || ! hermes --version >/dev/null 2>&1; then
@@ -86,9 +129,20 @@ export PATH="$HOME/.local/bin:$PATH"
 if (( SKIP_DESKTOP )); then
   note "skipping the desktop client (--skip-desktop)"
 else
-  if [[ -d "$ROOT/apps/desktop/node_modules" && -d "$ROOT/apps/desktop/dist" ]]; then
-    ok "desktop client already built"
+  # "Built" means built FROM THE PINNED REF, not merely present: the build stamp
+  # records the commit it was built from.
+  STAMP="$ROOT/apps/desktop/build/install-stamp.json"
+  BUILT_COMMIT=""
+  [[ -f "$STAMP" ]] && BUILT_COMMIT="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('commit',''))" "$STAMP" 2>/dev/null || true)"
+  WANT_COMMIT=""
+  (( ROOT_OWNED )) && WANT_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -d "$ROOT/apps/desktop/node_modules" && -d "$ROOT/apps/desktop/dist" ]] \
+     && { (( ! ROOT_OWNED )) || [[ -n "$WANT_COMMIT" && "$BUILT_COMMIT" == "$WANT_COMMIT" ]]; }; then
+    ok "desktop client already built${BUILT_COMMIT:+ from ${BUILT_COMMIT:0:10}}"
   else
+    if [[ -n "$BUILT_COMMIT" && "$BUILT_COMMIT" != "$WANT_COMMIT" ]]; then
+      note "the existing build is from ${BUILT_COMMIT:0:10}, not ${WANT_COMMIT:0:10} ($REF) -- rebuilding"
+    fi
     # The Electron build needs node/npm, and a fresh machine has neither:
     #   "Desktop GUI requires Node.js/npm, but npm was not found on PATH."
     # Nothing in the chain provides it. On this machine node existed only because
@@ -130,9 +184,32 @@ else
     fi
 
     echo "==> building the desktop client (Electron; several minutes)"
-    hermes desktop --build-only >"$HERMES_LOG_DIR"/hermes-desktop-build.log 2>&1 \
-      || { tail -25 "$HERMES_LOG_DIR"/hermes-desktop-build.log >&2; die "desktop build failed -- "$HERMES_LOG_DIR"/hermes-desktop-build.log"; }
+    # Run from the checkout's own venv, not whatever `hermes` is first on PATH.
+    # --force-build because an older build of a different ref can look current.
+    if (( ROOT_OWNED )) && [[ -x "$ROOT/venv/bin/python" ]]; then
+      ( cd "$ROOT" && venv/bin/python -m hermes_cli.main desktop --build-only --force-build ) \
+        >"$HERMES_LOG_DIR"/hermes-desktop-build.log 2>&1 \
+        || { tail -25 "$HERMES_LOG_DIR"/hermes-desktop-build.log >&2; die "desktop build failed -- "$HERMES_LOG_DIR"/hermes-desktop-build.log"; }
+    else
+      hermes desktop --build-only >"$HERMES_LOG_DIR"/hermes-desktop-build.log 2>&1 \
+        || { tail -25 "$HERMES_LOG_DIR"/hermes-desktop-build.log >&2; die "desktop build failed -- "$HERMES_LOG_DIR"/hermes-desktop-build.log"; }
+    fi
     ok "desktop client built"
+  fi
+
+  # After EVERY build, not only the first: a rebuild recreates chrome-sandbox as
+  # the user, 0755. Electron aborts at startup when kernel.apparmor_restrict_
+  # unprivileged_userns=1 (the Ubuntu default on a Spark) and its SUID helper is
+  # not root:root 4755. Needs sudo; the healthcheck flags it if this could not run.
+  if CS="$(hermes_chrome_sandbox_path "$ROOT")"; then
+    if [[ "$(stat -c '%U:%G %a' "$CS")" == "root:root 4755" ]]; then
+      ok "chrome-sandbox already root:root 4755"
+    elif hermes_chrome_sandbox_fix "$CS"; then
+      ok "chrome-sandbox set root:root 4755 (Electron's SUID sandbox helper)"
+    else
+      warn "could not set chrome-sandbox root:root 4755 -- the desktop app will not start"
+      note "run:  sudo chown root:root '$CS' && sudo chmod 4755 '$CS'"
+    fi
   fi
   note "launch it with: hermes desktop"
 fi

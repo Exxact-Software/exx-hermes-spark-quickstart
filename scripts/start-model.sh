@@ -80,6 +80,12 @@ fi
 # again when -- and only when -- vLLM dies of the known inspection crash
 # (hermes_vllm_inspect_crashed in scripts/lib/common.sh).
 launch_vllm() {
+  # AGENT_THINKING=off (profile knob): the model's thinking phase is off unless a
+  # request asks for it. A server-side default, outside the sandbox's sealed
+  # config, so it survives a sandbox stop/start and a reboot.
+  local think_args=()
+  [[ "${AGENT_THINKING:-default}" == off ]] \
+    && think_args=(--default-chat-template-kwargs '{"enable_thinking": false}')
   docker run -d --name "$VLLM_CONTAINER" \
     --gpus all --ipc=host \
     --memory="$MEM_CAP" --memory-swap="$MEM_CAP" \
@@ -95,6 +101,7 @@ launch_vllm() {
       --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
       --trust-remote-code --host 0.0.0.0 --port "$VLLM_PORT" \
       --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
+      ${think_args[@]+"${think_args[@]}"} \
       ${VLLM_EXTRA_ARGS:-} >/dev/null
 }
 
